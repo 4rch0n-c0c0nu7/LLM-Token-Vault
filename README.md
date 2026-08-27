@@ -1,3 +1,4 @@
+<img width="532" height="632" alt="screenshot" src="https://github.com/user-attachments/assets/fb09d4de-31dc-4be4-9a86-b4effcc2794a" />
 **LLM Token Vault & Routing HUD 🛡️**
 
 An encrypted, lightweight API key manager and multi-provider routing dashboard designed for edge computing, cyberdecks, and local AI projects.

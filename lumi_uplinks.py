@@ -33,8 +33,6 @@ DEFAULT_PROVIDERS = [
      "base_url": "https://openrouter.ai/api/v1", "model": "nvidia/nemotron-3-super-120b-a12b:free", "tools": True},
     {"id": "MISTRAL", "name": "Mistral", "key_env": "MISTRAL_API_KEY",
      "base_url": "https://api.mistral.ai/v1", "model": "ministral-8b-latest", "tools": True},
-    {"id": "OPENAI", "name": "OpenAI", "key_env": "OPENAI_API_KEY",
-     "base_url": "https://api.openai.com/v1", "model": "gpt-4o-mini", "tools": True},
 ]
 ROUTE_IDS = ["LOCAL"] + [p["id"] for p in DEFAULT_PROVIDERS] + ["AUTO"]
 

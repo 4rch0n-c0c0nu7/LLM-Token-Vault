@@ -36,7 +36,7 @@ FONT_SMALL = (MONO, 12)
 FONT_TINY = (MONO, 11)
 
 ROUTE_LABELS = [("LOCAL (Ollama)", "LOCAL"), ("GROQ", "GROQ"), ("GOOGLE", "GOOGLE"), ("CEREBRAS", "CEREBRAS"),
-                ("OPENROUTER", "OPENROUTER"), ("MISTRAL", "MISTRAL"), ("OPENAI", "OPENAI"), ("AUTO ROTATE", "AUTO")]
+                ("OPENROUTER", "OPENROUTER"), ("MISTRAL", "MISTRAL"), ("AUTO ROTATE", "AUTO")]
 
 
 def key_for(keys, p):

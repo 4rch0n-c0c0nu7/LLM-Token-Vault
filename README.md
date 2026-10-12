@@ -12,7 +12,7 @@ Most open-source AI projects tell you to paste your highly sensitive API keys in
 
 **The Solution**
 
-This project provides a scalpel instead of a sledgehammer. It features a pure-Python, lightweight Tkinter HUD that routes your prompts across multiple providers (Groq, Gemini, Cerebras, OpenRouter, Mistral, OpenAI) while keeping your API keys locked inside a hardware-tied AES-256 encrypted vault.
+This project provides a scalpel instead of a sledgehammer. It features a pure-Python, lightweight Tkinter HUD that routes your prompts across multiple providers (Groq, Gemini, Cerebras, OpenRouter, Mistral) while keeping your API keys locked inside a hardware-tied AES-256 encrypted vault.
 
 **Key Features**
 

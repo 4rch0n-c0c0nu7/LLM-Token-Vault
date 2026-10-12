@@ -1,497 +1,527 @@
-import tkinter as tk
-import json
-import os
-import time
-import threading
-import urllib.request
-import urllib.error
-from lumi_vault import secure_load_keys, secure_save_keys
+"""
+Lumi Token Dashboard v2 — routing, API keys, and *real* uplink health/usage.
 
-KEYS_FILE = os.path.expanduser("~/lumi_keys.json")
-ROUTING_FILE = os.path.expanduser("~/lumi_routing.json")
-# Use fast RAM disk on Linux, fallback to home directory for Windows/Mac users
-CACHE_FILE = '/dev/shm/token_cache.json' if os.path.exists('/dev/shm') else os.path.expanduser('~/.lumi_token_cache.json')
+What's real now:
+  - Status comes from actual chat calls on the configured model (Lumi's own calls, or TEST ALL),
+    so a retired model shows up as FAILING instead of "SUCCESS".
+  - Usage = tokens/requests Lumi actually spent today (~/.lumi_usage.json) plus the provider's
+    own rate-limit headers when it sends them (Groq, Cerebras, Mistral). Gemini sends none.
+  - Model per provider is selectable from the provider's live model list.
+  - Keys can be exported/imported with a passphrase (the vault itself only opens on this machine).
+"""
+import os
+import queue
+import sys
+import threading
+import time
+import tkinter as tk
+from tkinter import filedialog, simpledialog
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from lumi_vault import secure_load_keys, secure_save_keys  # noqa: E402
+import lumi_uplinks as up  # noqa: E402
 
 BG_COLOR = "#0A0A10"
 PANEL_COLOR = "#14141E"
 ACCENT_COLOR = "#00FFAA"
 TEXT_MAIN = "#E0E0E0"
-TEXT_DIM = "#606070"
+TEXT_DIM = "#8A8A9C"
 WARN_COLOR = "#FF3366"
+CAUTION_COLOR = "#FFB020"
 USED_GREY = "#2A2A36"
-FONT_TITLE = ("Consolas", 13, "bold")
-FONT_BODY = ("Consolas", 9)
-FONT_SMALL = ("Consolas", 8)
+MONO = "DejaVu Sans Mono"  # Consolas isn't on Linux; Tk was substituting a tiny fallback
+FONT_TITLE = (MONO, 17, "bold")
+FONT_BODY = (MONO, 13)
+FONT_SMALL = (MONO, 12)
+FONT_TINY = (MONO, 11)
+
+ROUTE_LABELS = [("LOCAL (Ollama)", "LOCAL"), ("GROQ", "GROQ"), ("GOOGLE", "GOOGLE"), ("CEREBRAS", "CEREBRAS"),
+                ("OPENROUTER", "OPENROUTER"), ("MISTRAL", "MISTRAL"), ("OPENAI", "OPENAI"), ("AUTO ROTATE", "AUTO")]
+
+
+def key_for(keys, p):
+    k = keys.get(p["key_env"], "").strip()
+    if not k and p["id"] == "GOOGLE":
+        k = keys.get("GEMINI_API_KEY", "").strip()
+    return k
+
+
+def ago(ts):
+    if not ts:
+        return "never"
+    s = int(time.time() - ts)
+    if s < 60:
+        return f"{s}s ago"
+    if s < 3600:
+        return f"{s // 60}m ago"
+    if s < 86400:
+        return f"{s // 3600}h ago"
+    return time.strftime("%b %d", time.localtime(ts))
+
 
 class TokenDashboard:
     def __init__(self, root):
         self.root = root
-        self.root.title("Lumi Tactical Multi-Provider Uplink & Token HUD")
-        self.root.geometry("640x700")
-        self.root.minsize(500, 450)
+        self.root.title("Lumi Uplink & Token HUD")
+        self.root.geometry("900x940")
+        self.root.minsize(640, 520)
         self.root.configure(bg=BG_COLOR)
-        
-        self.routing_mode = tk.StringVar(value="LOCAL")
-        self.provider_cards = {}
-        
+
+        self.routing_mode = tk.StringVar(value=up.get_route())
+        self.cards = {}
+        self.or_credit = None
+        self.busy = False
+        self.ui_q = queue.Queue()  # worker threads hand UI updates to the Tk thread through this
+
         self.seed_config_files()
         self.init_ui()
         self.update_clock()
-        self.poll_token_cache()
+        self.refresh_cards()
+        self.drain_ui_queue()
+
+    # ---------- setup ----------
 
     def seed_config_files(self):
         try:
-            os.makedirs(os.path.dirname(KEYS_FILE), exist_ok=True)
-            if not os.path.exists(KEYS_FILE):
-                initial_keys = {
-                    "GROQ_API_KEY": "", 
-                    "GOOGLE_API_KEY": "", 
-                    "OPENROUTER_API_KEY": "", 
-                    "OPENAI_API_KEY": "",
-                    "CEREBRAS_API_KEY": "",
-                    "MISTRAL_API_KEY": ""
-                }
-                secure_save_keys(initial_keys)
-            
-            if not os.path.exists(ROUTING_FILE):
-                with open(ROUTING_FILE, "w") as f:
-                    json.dump({"default_mode": "LOCAL", "strategy": "manual"}, f, indent=4)
-            else:
-                with open(ROUTING_FILE, "r") as f:
-                    data = json.load(f)
-                    self.routing_mode.set(data.get("default_mode", "LOCAL"))
+            if not os.path.exists(up.ROUTING_FILE):
+                up.set_route("LOCAL")
+            if not secure_load_keys() and not os.path.exists(os.path.expanduser("~/lumi_keys.json")):
+                secure_save_keys({p["key_env"]: "" for p in up.DEFAULT_PROVIDERS})
         except Exception as e:
             print(f"[!] Config initialization warning: {e}")
 
     def save_routing(self):
         mode = self.routing_mode.get()
-        strategy = "auto" if mode == "AUTO" else "manual"
         try:
-            with open(ROUTING_FILE, "w") as f:
-                json.dump({"default_mode": mode, "strategy": strategy}, f, indent=4)
-            self.log_output(f"Routing updated: {mode}")
+            up.set_route(mode)
+            self.log_output(f"Routing set to {mode}. Lumi picks this up on her next message.")
         except Exception as e:
-            print(f"[!] Failed to save routing: {e}")
+            self.log_output(f"[!] Failed to save routing: {e}")
+        self.refresh_cards(reschedule=False)
 
-    def load_keys(self):
-        return secure_load_keys()
+    # ---------- layout ----------
 
     def init_ui(self):
-        # Main scrollable canvas container to prevent cutoff on smaller screens
         container = tk.Frame(self.root, bg=BG_COLOR)
         container.pack(fill="both", expand=True)
 
         canvas = tk.Canvas(container, bg=BG_COLOR, highlightthickness=0)
         scrollbar = tk.Scrollbar(container, orient="vertical", command=canvas.yview)
-        
         self.scrollable_frame = tk.Frame(canvas, bg=BG_COLOR)
-        self.scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-
-        canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        self.scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        win = canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win, width=e.width))
         canvas.configure(yscrollcommand=scrollbar.set)
-
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
-        # Enable mousewheel scrolling across platforms
-        def _on_mousewheel(event):
-            canvas.yview_scroll(int(-1*(event.delta/120)), "units")
-        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        # Mouse wheel: Linux/X11 sends Button-4/5, Windows/macOS send <MouseWheel>.
+        def wheel(event):
+            if event.num == 4:
+                canvas.yview_scroll(-2, "units")
+            elif event.num == 5:
+                canvas.yview_scroll(2, "units")
+            elif event.delta:
+                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
-        # Title Header
-        title_frame = tk.Frame(self.scrollable_frame, bg=BG_COLOR)
-        title_frame.pack(fill="x", pady=6)
-        tk.Label(title_frame, text="LUMI TACTICAL COMMAND & TOKEN HUD", font=FONT_TITLE, bg=BG_COLOR, fg=ACCENT_COLOR).pack()
-        self.clock_label = tk.Label(title_frame, text="00:00:00", font=FONT_SMALL, bg=BG_COLOR, fg=TEXT_DIM)
+        def bind_wheel(_):
+            for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                self.root.bind_all(seq, wheel)
+
+        def unbind_wheel(_):
+            for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                self.root.unbind_all(seq)
+
+        canvas.bind("<Enter>", bind_wheel)
+        canvas.bind("<Leave>", unbind_wheel)
+
+        sf = self.scrollable_frame
+        title = tk.Frame(sf, bg=BG_COLOR)
+        title.pack(fill="x", pady=6)
+        tk.Label(title, text="LUMI UPLINK & TOKEN HUD", font=FONT_TITLE, bg=BG_COLOR, fg=ACCENT_COLOR).pack()
+        self.clock_label = tk.Label(title, text="", font=FONT_SMALL, bg=BG_COLOR, fg=TEXT_DIM)
         self.clock_label.pack()
 
-        # Primary Routing Frame
-        route_frame = tk.LabelFrame(self.scrollable_frame, text=" PRIMARY ROUTING & AI SELECTION ", font=FONT_BODY, bg=PANEL_COLOR, fg=ACCENT_COLOR, bd=1)
-        route_frame.pack(fill="x", padx=15, pady=3, ipady=2)
+        route = tk.LabelFrame(sf, text=" PRIMARY ROUTING ", font=FONT_BODY, bg=PANEL_COLOR, fg=ACCENT_COLOR, bd=1)
+        route.pack(fill="x", padx=15, pady=3, ipady=2)
+        grid = tk.Frame(route, bg=PANEL_COLOR)
+        grid.pack(expand=True, pady=2)
+        for i, (text, mode) in enumerate(ROUTE_LABELS):
+            tk.Radiobutton(grid, text=text, variable=self.routing_mode, value=mode, font=FONT_SMALL,
+                           bg=PANEL_COLOR, fg=TEXT_MAIN, selectcolor=BG_COLOR, activebackground=PANEL_COLOR,
+                           activeforeground=ACCENT_COLOR, command=self.save_routing
+                           ).grid(row=i // 4, column=i % 4, sticky="w", padx=8, pady=1)
+        self.route_hint = tk.Label(route, text="", font=FONT_TINY, bg=PANEL_COLOR, fg=TEXT_DIM, justify="left")
+        self.route_hint.pack(anchor="w", padx=8)
+        self.last_answer = tk.Label(route, text="", font=FONT_TINY, bg=PANEL_COLOR, fg=TEXT_MAIN)
+        self.last_answer.pack(anchor="w", padx=8, pady=(0, 2))
 
-        modes = [
-            ("LOCAL (Ollama)", "LOCAL"), 
-            ("GROQ", "GROQ"), 
-            ("GOOGLE", "GOOGLE"), 
-            ("OPENROUTER", "OPENROUTER"), 
-            ("OPENAI", "OPENAI"),
-            ("CEREBRAS", "CEREBRAS"),
-            ("MISTRAL", "MISTRAL"),
-            ("AUTO ROTATE", "AUTO")
-        ]
-        
-        grid_frame = tk.Frame(route_frame, bg=PANEL_COLOR)
-        grid_frame.pack(expand=True, pady=2)
-        
-        for i, (text, mode) in enumerate(modes):
-            tk.Radiobutton(
-                grid_frame, text=text, variable=self.routing_mode, value=mode, 
-                font=FONT_SMALL, bg=PANEL_COLOR, fg=TEXT_MAIN, 
-                selectcolor=BG_COLOR, activebackground=PANEL_COLOR, activeforeground=ACCENT_COLOR,
-                command=self.save_routing
-            ).grid(row=i//4, column=i%4, sticky="w", padx=8, pady=1)
-
-        # Provider Cards Status Frame
-        status_frame = tk.LabelFrame(self.scrollable_frame, text=" LIVE API KEY STATUS & TOKEN METRICS ", font=FONT_BODY, bg=PANEL_COLOR, fg=ACCENT_COLOR, bd=1)
-        status_frame.pack(fill="x", padx=15, pady=3, ipadx=5, ipady=2)
-
-        self.cards_container = tk.Frame(status_frame, bg=PANEL_COLOR)
+        status = tk.LabelFrame(sf, text=" UPLINKS · HEALTH · USAGE TODAY ", font=FONT_BODY, bg=PANEL_COLOR,
+                               fg=ACCENT_COLOR, bd=1)
+        status.pack(fill="x", padx=15, pady=3, ipadx=5, ipady=2)
+        self.cards_container = tk.Frame(status, bg=PANEL_COLOR)
         self.cards_container.pack(fill="x", expand=True, padx=8, pady=2)
-
         self.build_provider_cards()
 
-        # Control Buttons Frame
-        btn_frame = tk.Frame(self.scrollable_frame, bg=BG_COLOR)
-        btn_frame.pack(fill="x", padx=15, pady=4)
-        
-        tk.Button(btn_frame, text="Manage API Keys", font=FONT_BODY, bg=PANEL_COLOR, fg=TEXT_MAIN, relief="flat", command=self.open_keys_editor).pack(side="left", padx=4, fill="x", expand=True)
-        tk.Button(btn_frame, text="⚡ Ping All Uplinks", font=FONT_BODY, bg=PANEL_COLOR, fg=ACCENT_COLOR, relief="flat", command=self.ping_all_providers).pack(side="left", padx=4, fill="x", expand=True)
+        btns = tk.Frame(sf, bg=BG_COLOR)
+        btns.pack(fill="x", padx=15, pady=4)
+        for text, fg, cmd in [("Manage API Keys", TEXT_MAIN, self.open_keys_editor),
+                              ("⚡ Test All Uplinks", ACCENT_COLOR, self.test_all),
+                              ("Export Keys…", TEXT_MAIN, self.export_keys),
+                              ("Import Keys…", TEXT_MAIN, self.import_keys)]:
+            tk.Button(btns, text=text, font=FONT_BODY, bg=PANEL_COLOR, fg=fg, relief="flat",
+                      command=cmd).pack(side="left", padx=3, fill="x", expand=True)
 
-        # Telemetry Log Section
-        log_header_frame = tk.Frame(self.scrollable_frame, bg=BG_COLOR)
-        log_header_frame.pack(fill="x", padx=15, pady=(2, 0))
-        tk.Label(log_header_frame, text="UPLINK TELEMETRY LOG", font=FONT_SMALL, bg=BG_COLOR, fg=ACCENT_COLOR).pack(side="left")
-        tk.Button(log_header_frame, text="📋 Copy Log", font=("Consolas", 7), bg=PANEL_COLOR, fg=TEXT_MAIN, bd=0, relief="flat", command=self.copy_log_text).pack(side="right")
-
-        log_frame = tk.Frame(self.scrollable_frame, bg=PANEL_COLOR, bd=1, relief="solid")
-        log_frame.pack(fill="x", padx=15, pady=(2, 10))
-        
-        self.log_box = tk.Text(log_frame, height=4, bg=BG_COLOR, fg=TEXT_MAIN, font=("Consolas", 8), bd=0, highlightthickness=0, exportselection=True)
+        lh = tk.Frame(sf, bg=BG_COLOR)
+        lh.pack(fill="x", padx=15, pady=(2, 0))
+        tk.Label(lh, text="UPLINK TELEMETRY LOG", font=FONT_SMALL, bg=BG_COLOR, fg=ACCENT_COLOR).pack(side="left")
+        tk.Button(lh, text="📋 Copy Log", font=FONT_TINY, bg=PANEL_COLOR, fg=TEXT_MAIN, bd=0, relief="flat",
+                  command=self.copy_log_text).pack(side="right")
+        lf = tk.Frame(sf, bg=PANEL_COLOR, bd=1, relief="solid")
+        lf.pack(fill="x", padx=15, pady=(2, 10))
+        self.log_box = tk.Text(lf, height=7, bg=BG_COLOR, fg=TEXT_MAIN, font=FONT_TINY, bd=0,
+                               highlightthickness=0, wrap="word")
         self.log_box.pack(fill="both", expand=True, padx=6, pady=4)
-        self.log_box.insert(tk.END, "Dashboard initialized. Vault encryption active.\n")
+        self.log_output("Dashboard v2 ready. Status shows real calls; press TEST ALL for a fresh check.")
+
+    def build_provider_cards(self):
+        for w in self.cards_container.winfo_children():
+            w.destroy()
+        self.cards = {}
+        for p in up.load_providers():
+            card = tk.Frame(self.cards_container, bg=BG_COLOR, bd=1, relief="solid")
+            card.pack(fill="x", pady=2, ipady=1, ipadx=3)
+
+            top = tk.Frame(card, bg=BG_COLOR)
+            top.pack(fill="x", padx=5, pady=1)
+            name = tk.Label(top, text=f"■ {p['name']}", font=FONT_SMALL, bg=BG_COLOR, fg=TEXT_DIM)
+            name.pack(side="left")
+            state = tk.Label(top, text="", font=FONT_SMALL, bg=BG_COLOR, fg=TEXT_DIM)
+            state.pack(side="right")
+
+            mrow = tk.Frame(card, bg=BG_COLOR)
+            mrow.pack(fill="x", padx=5)
+            model = tk.Label(mrow, text="", font=FONT_TINY, bg=BG_COLOR, fg=TEXT_MAIN)
+            model.pack(side="left")
+            tk.Button(mrow, text="change model", font=FONT_TINY, bg=PANEL_COLOR, fg=TEXT_MAIN, bd=0,
+                      relief="flat", command=lambda pid=p["id"]: self.open_model_picker(pid)).pack(side="right")
+            tk.Button(mrow, text="test", font=FONT_TINY, bg=PANEL_COLOR, fg=ACCENT_COLOR, bd=0,
+                      relief="flat", command=lambda pid=p["id"]: self.test_some([pid])).pack(side="right", padx=4)
+
+            meters = tk.Frame(card, bg=BG_COLOR)
+            meters.pack(fill="x", padx=5, pady=1)
+            usage = tk.Label(card, text="", font=FONT_TINY, bg=BG_COLOR, fg=TEXT_MAIN, anchor="w", justify="left")
+            usage.pack(fill="x", padx=5)
+            err = tk.Label(card, text="", font=FONT_TINY, bg=BG_COLOR, fg=WARN_COLOR, anchor="w", justify="left",
+                           wraplength=780)
+            err.pack(fill="x", padx=5)
+            self.cards[p["id"]] = {"name": name, "state": state, "model": model, "meters": meters,
+                                   "usage": usage, "err": err, "meter_sig": None}
+
+    # ---------- live refresh ----------
+
+    def refresh_cards(self, reschedule=True):
+        try:
+            keys = secure_load_keys()
+            usage = up.load_usage()
+            route = up.get_route()
+            if self.routing_mode.get() != route:
+                self.routing_mode.set(route)
+            for p in up.load_providers():
+                c = self.cards.get(p["id"])
+                if c:
+                    self._paint_card(c, p, bool(key_for(keys, p)), usage.get(p["id"], {}), route)
+            self._paint_routing(route, usage)
+        except Exception as e:
+            self.log_output(f"[!] Refresh error: {e}")
+        if reschedule:
+            self.root.after(5000, self.refresh_cards)
+
+    def _paint_routing(self, route, usage):
+        if route == "LOCAL":
+            hint = "Lumi stays on local Ollama (offline, private, slower)."
+        elif route == "AUTO":
+            hint = "Lumi starts with whichever uplink answered last, rotates on failure, then local Ollama."
+        else:
+            hint = f"Lumi tries {route} first, then the other uplinks, then local Ollama."
+        self.route_hint.config(text=hint)
+        last = up.get_last_active()
+        oks = [(e.get("last_ok", 0), pid) for pid, e in usage.items() if e.get("last_ok")]
+        when = ago(max(oks)[0]) if oks else "—"
+        self.last_answer.config(text=f"Last cloud answer: {last or '—'} ({when})")
+
+    def _paint_card(self, c, p, has_key, e, route):
+        last_ok, last_err = e.get("last_ok", 0), e.get("last_error", 0)
+        msg = e.get("last_error_msg", "")
+        if not has_key:
+            state, color = "NO KEY", WARN_COLOR
+        elif last_err and last_err > last_ok:
+            retired = any(w in msg.lower() for w in ("decommission", "does not exist", "not found", "no longer"))
+            state, color = ("MODEL RETIRED?" if retired else "FAILING"), WARN_COLOR
+        elif last_ok:
+            state, color = "READY", ACCENT_COLOR
+        else:
+            state, color = "UNTESTED", CAUTION_COLOR
+        if route == p["id"]:
+            state = "▶ PRIMARY · " + state
+        c["state"].config(text=state, fg=color)
+        c["name"].config(fg=ACCENT_COLOR if has_key else TEXT_DIM)
+        c["model"].config(text=f"model: {p['model']}")
+
+        line = (f"Today: {e.get('requests_today', 0)} calls · {e.get('tokens_today', 0):,} tokens"
+                f" · {e.get('errors_today', 0)} errors   |   last OK {ago(last_ok)}")
+        if p["id"] == "OPENROUTER" and self.or_credit:
+            cr = self.or_credit
+            line += f"\nAccount spend: ${float(cr.get('usage') or 0):.2f}"
+            if cr.get("limit") is not None:
+                line += f" of ${float(cr['limit']):.2f}"
+            if cr.get("is_free_tier"):
+                line += " (free tier)"
+        if p["id"] == "GOOGLE":
+            line += "\nGemini reports no quota headers; counts above are Lumi's own."
+        c["usage"].config(text=line)
+        c["err"].config(text=f"last error ({ago(last_err)}): {msg}" if last_err and last_err > last_ok else "")
+
+        meters = up.ratelimit_meters(e.get("ratelimits", {}), p["id"])
+        sig = (tuple(meters), int(e.get("ratelimits_at", 0)) // 60)
+        if sig != c["meter_sig"]:
+            c["meter_sig"] = sig
+            for w in c["meters"].winfo_children():
+                w.destroy()
+            for label, rem, lim in meters:
+                self._meter(c["meters"], label, rem, lim, e.get("ratelimits_at"))
+
+    def _meter(self, parent, label, rem, lim, at):
+        row = tk.Frame(parent, bg=BG_COLOR)
+        row.pack(fill="x", pady=1)
+        tk.Label(row, text=f"{label}: {rem:,} / {lim:,} left  ({ago(at)})", font=FONT_TINY, bg=BG_COLOR,
+                 fg=TEXT_MAIN, width=46, anchor="w").pack(side="left")
+        bar = tk.Canvas(row, height=12, bg=PANEL_COLOR, highlightthickness=0)
+        bar.pack(side="left", fill="x", expand=True, padx=(4, 0))
+        frac = max(0.0, min(1.0, rem / lim)) if lim > 0 else 0.0
+        color = ACCENT_COLOR if frac > 0.25 else (CAUTION_COLOR if frac > 0.05 else WARN_COLOR)
+
+        def draw(_=None):
+            bar.delete("all")
+            w = max(bar.winfo_width(), 10)
+            bar.create_rectangle(0, 0, w, 12, fill=USED_GREY, outline="")
+            bar.create_rectangle(0, 0, int(w * frac), 12, fill=color, outline="")
+        bar.bind("<Configure>", draw)
+
+    # ---------- actions ----------
+
+    def test_all(self):
+        self.test_some([p["id"] for p in up.load_providers()])
+
+    def test_some(self, pids):
+        if self.busy:
+            self.log_output("A test is already running…")
+            return
+        self.busy = True
+
+        def worker():
+            keys = secure_load_keys()
+            ok_count, tried = 0, 0
+            for p in up.load_providers():
+                if p["id"] not in pids:
+                    continue
+                k = key_for(keys, p)
+                if not k:
+                    self.ui(lambda n=p["name"]: self.log_output(f"[{n}] skipped (no key)"))
+                    continue
+                tried += 1
+                ok, msg = up.test_provider(p, k)
+                ok_count += ok
+                self.ui(lambda n=p["name"], ok=ok, msg=msg:
+                                self.log_output(f"[{n}] {'OK' if ok else 'FAILED'} — {msg}"))
+                if p["id"] == "OPENROUTER":
+                    try:
+                        self.or_credit = up.openrouter_credit(k)
+                    except Exception:
+                        pass
+                time.sleep(1.0)
+            self.ui(lambda: self.log_output(f"Test finished: {ok_count}/{tried} uplinks answering."))
+            self.ui(lambda: self.refresh_cards(reschedule=False))
+            self.busy = False
+
+        self.log_output("Testing with a tiny real chat call on each configured model…")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def open_model_picker(self, pid):
+        p = next(x for x in up.load_providers() if x["id"] == pid)
+        k = key_for(secure_load_keys(), p)
+        if not k:
+            self.log_output(f"[{p['name']}] add a key first.")
+            return
+        pop = tk.Toplevel(self.root)
+        pop.title(f"{p['name']} models")
+        pop.geometry("620x640")
+        pop.configure(bg=BG_COLOR)
+        tk.Label(pop, text=f"{p['name'].upper()} — PICK A MODEL", font=FONT_BODY, bg=BG_COLOR,
+                 fg=ACCENT_COLOR).pack(pady=6)
+        tk.Label(pop, text=f"current: {p['model']}", font=FONT_TINY, bg=BG_COLOR, fg=TEXT_MAIN).pack()
+        flt = tk.Entry(pop, font=FONT_BODY, bg=PANEL_COLOR, fg=ACCENT_COLOR, insertbackground=TEXT_MAIN)
+        flt.pack(fill="x", padx=10, pady=4)
+        lb = tk.Listbox(pop, font=FONT_SMALL, bg=PANEL_COLOR, fg=TEXT_MAIN, selectbackground=USED_GREY,
+                        selectforeground=ACCENT_COLOR, highlightthickness=0, bd=0)
+        lb.pack(fill="both", expand=True, padx=10, pady=4)
+        models = []
+
+        def fill(*_):
+            q = flt.get().strip().lower()
+            lb.delete(0, tk.END)
+            for m in models:
+                if q in m.lower():
+                    lb.insert(tk.END, m)
+                    if m == p["model"]:
+                        lb.itemconfig(tk.END, fg=ACCENT_COLOR)
+
+        def loaded(result):
+            lb.delete(0, tk.END)
+            if isinstance(result, Exception):
+                lb.insert(tk.END, f"[could not list models: {result}]")
+                return
+            models[:] = result
+            fill()
+
+        def fetch():
+            try:
+                res = up.list_models(p, k)
+            except Exception as ex:
+                res = ex
+            self.ui(lambda: loaded(res) if pop.winfo_exists() else None)
+
+        def choose(*_):
+            sel = lb.curselection()
+            if not sel:
+                return
+            m = lb.get(sel[0])
+            if m.startswith("["):
+                return
+            up.set_model(pid, m)
+            self.log_output(f"[{p['name']}] model set to {m}. Testing it…")
+            pop.destroy()
+            self.refresh_cards(reschedule=False)
+            self.test_some([pid])
+
+        flt.bind("<KeyRelease>", fill)
+        lb.bind("<Double-Button-1>", choose)
+        tk.Button(pop, text="USE THIS MODEL", font=FONT_BODY, bg=PANEL_COLOR, fg=TEXT_MAIN, relief="flat",
+                  command=choose).pack(pady=6)
+        lb.insert(tk.END, "[loading…]")
+        threading.Thread(target=fetch, daemon=True).start()
+
+    def open_keys_editor(self):
+        pop = tk.Toplevel(self.root)
+        pop.title("API Key Configuration")
+        pop.geometry("700x440")
+        pop.configure(bg=BG_COLOR)
+        pop.resizable(False, False)
+        tk.Label(pop, text="UPLINK CREDENTIALS", font=FONT_TITLE, bg=BG_COLOR, fg=ACCENT_COLOR).pack(pady=8)
+        current = secure_load_keys()
+        entries = {}
+        form = tk.Frame(pop, bg=BG_COLOR)
+        form.pack(fill="x", padx=15, pady=3)
+        for p in up.DEFAULT_PROVIDERS:
+            row = tk.Frame(form, bg=BG_COLOR)
+            row.pack(fill="x", pady=3)
+            tk.Label(row, text=p["name"] + ":", width=14, anchor="e", font=FONT_BODY, bg=BG_COLOR,
+                     fg=TEXT_MAIN).pack(side="left")
+            ent = tk.Entry(row, font=FONT_BODY, bg=PANEL_COLOR, fg=ACCENT_COLOR, insertbackground=TEXT_MAIN, show="*")
+            ent.pack(side="left", fill="x", expand=True, padx=4)
+            ent.insert(0, key_for(current, p))
+            entries[p["key_env"]] = ent
+
+        def save():
+            for k_id, ent in entries.items():
+                current[k_id] = ent.get().strip()
+            if current.get("GOOGLE_API_KEY"):
+                current["GEMINI_API_KEY"] = current["GOOGLE_API_KEY"]
+            if secure_save_keys(current):
+                self.log_output("Encrypted API credentials saved. Restart Lumi to load new keys.")
+                pop.destroy()
+                self.refresh_cards(reschedule=False)
+            else:
+                self.log_output("[!] Vault encryption save failed.")
+
+        tk.Button(pop, text="SAVE SECURE CREDENTIALS", font=FONT_BODY, bg=PANEL_COLOR, fg=TEXT_MAIN, relief="flat",
+                  command=save).pack(pady=10)
+
+    def export_keys(self):
+        keys = {k: v for k, v in secure_load_keys().items() if v}
+        if not keys:
+            self.log_output("[!] No keys to export.")
+            return
+        pw = simpledialog.askstring("Export keys", "Passphrase for the export file:", show="*", parent=self.root)
+        if not pw:
+            return
+        if pw != simpledialog.askstring("Export keys", "Repeat passphrase:", show="*", parent=self.root):
+            self.log_output("[!] Passphrases didn't match. Nothing exported.")
+            return
+        path = filedialog.asksaveasfilename(parent=self.root, initialdir=os.path.expanduser("~"),
+                                            initialfile="lumi_keys_export.lumikeys", defaultextension=".lumikeys")
+        if not path:
+            return
+        try:
+            up.export_keys(keys, pw, path)
+            self.log_output(f"Exported {len(keys)} keys to {path} (passphrase-locked). Move it to the new "
+                            f"machine, then Import Keys there and delete the file.")
+        except Exception as e:
+            self.log_output(f"[!] Export failed: {e}")
+
+    def import_keys(self):
+        path = filedialog.askopenfilename(parent=self.root, initialdir=os.path.expanduser("~"),
+                                          filetypes=[("Lumi key export", "*.lumikeys"), ("All files", "*")])
+        if not path:
+            return
+        pw = simpledialog.askstring("Import keys", "Passphrase:", show="*", parent=self.root)
+        if not pw:
+            return
+        try:
+            incoming = up.import_keys(path, pw)
+        except Exception:
+            self.log_output("[!] Import failed: wrong passphrase or not a Lumi export file.")
+            return
+        keys = secure_load_keys()
+        keys.update({k: v for k, v in incoming.items() if v})
+        if secure_save_keys(keys):
+            self.log_output(f"Imported {len(incoming)} keys into this machine's vault. You can delete {path}.")
+            self.refresh_cards(reschedule=False)
+        else:
+            self.log_output("[!] Could not save imported keys.")
+
+    # ---------- misc ----------
 
     def copy_log_text(self):
-        try:
-            log_content = self.log_box.get("1.0", tk.END).strip()
-            self.root.clipboard_clear()
-            self.root.clipboard_append(log_content)
-            self.log_output("Telemetry log copied to clipboard.")
-        except Exception as e:
-            print(f"[!] Copy error: {e}")
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.log_box.get("1.0", tk.END).strip())
+        self.log_output("Telemetry log copied to clipboard.")
 
     def log_output(self, message):
         self.log_box.insert(tk.END, f"[{time.strftime('%H:%M:%S')}] {message}\n")
         self.log_box.see(tk.END)
 
-    def build_provider_cards(self):
-        for widget in self.cards_container.winfo_children():
-            widget.destroy()
+    def ui(self, fn):
+        self.ui_q.put(fn)
 
-        providers = [
-            ("Groq", "GROQ_API_KEY"),
-            ("Google Gemini", "GOOGLE_API_KEY"),
-            ("OpenRouter", "OPENROUTER_API_KEY"),
-            ("OpenAI", "OPENAI_API_KEY"),
-            ("Cerebras", "CEREBRAS_API_KEY"),
-            ("Mistral AI", "MISTRAL_API_KEY")
-        ]
-
-        keys = self.load_keys()
-
-        for name, key_id in providers:
-            has_key = bool(keys.get(key_id, "").strip())
-            
-            card = tk.Frame(self.cards_container, bg=BG_COLOR, bd=1, relief="solid")
-            card.pack(fill="x", pady=1, ipady=1, ipadx=3)
-
-            top_row = tk.Frame(card, bg=BG_COLOR)
-            top_row.pack(fill="x", padx=5, pady=1)
-
-            lbl_name = tk.Label(top_row, text=f"■ {name}", font=FONT_SMALL, bg=BG_COLOR, fg=ACCENT_COLOR if has_key else TEXT_DIM)
-            lbl_name.pack(side="left")
-
-            lbl_state = tk.Label(top_row, text="CONFIGURED" if has_key else "NO KEY FOUND", font=FONT_SMALL, bg=BG_COLOR, fg=ACCENT_COLOR if has_key else WARN_COLOR)
-            lbl_state.pack(side="right")
-
-            canvas = tk.Canvas(card, height=8, bg=PANEL_COLOR, highlightthickness=0)
-            canvas.pack(fill="x", padx=5, pady=1)
-
-            metrics_row = tk.Frame(card, bg=BG_COLOR)
-            metrics_row.pack(fill="x", padx=5, pady=1)
-
-            lbl_metrics = tk.Label(metrics_row, text="Used: 0 / Limit: 0 | Left: 0 | Renews in: --", font=("Consolas", 7), bg=BG_COLOR, fg=TEXT_MAIN)
-            lbl_metrics.pack(side="left")
-
-            self.provider_cards[key_id] = {
-                "canvas": canvas,
-                "metrics": lbl_metrics,
-                "state": lbl_state
-            }
-            self.draw_progress_bar(canvas, 0, 15000, active=False)
-
-    def draw_progress_bar(self, canvas, used, limit, active=True):
-        canvas.delete("all")
-        w = canvas.winfo_width()
-        if w <= 1: 
-            w = 550
-        h = 8
-        
-        if not active:
-            canvas.create_rectangle(0, 0, w, h, fill=USED_GREY, outline="")
-            for x_pos in range(-h, w + h, 8):
-                canvas.create_line(x_pos, h, x_pos + h, 0, fill=TEXT_DIM, width=1)
-            return
-
-        if limit <= 0:
-            limit = 1
-        
-        used_clamped = max(0, min(used, limit))
-        used_width = int(w * (used_clamped / limit))
-        
-        canvas.create_rectangle(0, 0, w, h, fill=ACCENT_COLOR, outline="")
-        if used_width > 0:
-            canvas.create_rectangle(0, 0, used_width, h, fill=USED_GREY, outline="")
-            for x_pos in range(-h, used_width + h, 8):
-                canvas.create_line(x_pos, h, x_pos + h, 0, fill=TEXT_DIM, width=1)
+    def drain_ui_queue(self):
+        while True:
+            try:
+                fn = self.ui_q.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn()
+            except Exception as e:
+                print(f"[!] UI update error: {e}")
+        self.root.after(100, self.drain_ui_queue)
 
     def update_clock(self):
-        t = time.strftime("%Y-%m-%d %H:%M:%S")
-        self.clock_label.config(text=f"SYS TIME: {t}")
+        self.clock_label.config(text=f"SYS TIME: {time.strftime('%Y-%m-%d %H:%M:%S')}")
         self.root.after(1000, self.update_clock)
 
-    def poll_token_cache(self):
-        try:
-            if os.path.exists(CACHE_FILE):
-                with open(CACHE_FILE, 'r') as f:
-                    data = json.load(f)
-                    rem = data.get("remaining")
-                    lim = data.get("limit")
-                    if rem is not None and lim is not None:
-                        self.update_provider_ui("GROQ_API_KEY", rem, lim, "Live")
-        except Exception:
-            pass
-        self.root.after(5000, self.poll_token_cache)
-
-    def ping_all_providers(self):
-        def _ping_worker():
-            keys = self.load_keys()
-            
-            self.root.after(0, lambda: self.log_output("--- Starting Ping Cycle for All 6 Active Uplinks ---"))
-            success_count = 0
-
-            # 1. Groq Ping 
-            groq_key = keys.get("GROQ_API_KEY", "").strip()
-            if groq_key:
-                ping_success = False
-                last_err = ""
-                for gmodel in ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "groq/compound"]:
-                    try:
-                        req_data = json.dumps({"model": gmodel, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 1}).encode('utf-8')
-                        req = urllib.request.Request("https://api.groq.com/openai/v1/chat/completions", data=req_data, headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {groq_key}', 'User-Agent': 'Mozilla/5.0'}, method='POST')
-                        with urllib.request.urlopen(req, timeout=8) as res:
-                            rem = int(res.headers.get('x-ratelimit-remaining-tokens') or 14500)
-                            lim = int(res.headers.get('x-ratelimit-limit-tokens') or 15000)
-                            self.root.after(0, lambda r=rem, l=lim: self.update_provider_ui("GROQ_API_KEY", r, l, "Live"))
-                            self.root.after(0, lambda m=gmodel: self.log_output(f"[Groq] SUCCESS ({m})"))
-                            success_count += 1
-                            ping_success = True
-                            break
-                    except urllib.error.HTTPError as he:
-                        try:
-                            err_data = json.loads(he.read().decode('utf-8'))
-                            err_msg = err_data.get('error', {}).get('message', 'Unknown Error')
-                            last_err = f"HTTP {he.code}: {err_msg[:45]}..."
-                        except:
-                            last_err = f"HTTP {he.code}"
-                        continue
-                    except Exception as e:
-                        last_err = str(e)
-                        continue
-                if not ping_success:
-                    self.root.after(0, lambda: self.mark_provider_error("GROQ_API_KEY"))
-                    self.root.after(0, lambda err=last_err: self.log_output(f"[Groq] Ping FAILED: {err}"))
-            else:
-                self.root.after(0, lambda: self.log_output("[Groq] Skipped (No key)"))
-
-            # 2. Google Gemini Ping
-            google_key = keys.get("GOOGLE_API_KEY", "").strip()
-            if google_key:
-                ping_success = False
-                last_err = ""
-                for gmodel in ["gemini-2.0-flash-exp", "gemini-2.0-flash", "gemini-1.5-flash-8b", "gemini-1.5-pro", "gemini-1.5-flash"]:
-                    try:
-                        url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-                        req_data = json.dumps({"model": gmodel, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 1}).encode('utf-8')
-                        req = urllib.request.Request(url, data=req_data, headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {google_key}', 'User-Agent': 'Mozilla/5.0'}, method='POST')
-                        with urllib.request.urlopen(req, timeout=8) as res:
-                            self.root.after(0, lambda: self.update_provider_ui("GOOGLE_API_KEY", 14500, 15000, "Active"))
-                            self.root.after(0, lambda m=gmodel: self.log_output(f"[Google] SUCCESS ({m})"))
-                            success_count += 1
-                            ping_success = True
-                            break
-                    except urllib.error.HTTPError as he:
-                        try:
-                            raw_err = he.read().decode('utf-8')
-                            err_json = json.loads(raw_err)
-                            if isinstance(err_json, list):
-                                last_err = f"HTTP {he.code}: {err_json[0]['error']['message'][:45]}..."
-                            else:
-                                last_err = f"HTTP {he.code}: {err_json['error']['message'][:45]}..."
-                        except:
-                            last_err = f"HTTP {he.code}"
-                        continue
-                    except Exception as e:
-                        last_err = str(e)
-                        continue
-                if not ping_success:
-                    self.root.after(0, lambda: self.mark_provider_error("GOOGLE_API_KEY"))
-                    self.root.after(0, lambda err=last_err: self.log_output(f"[Google] Ping FAILED: {err}"))
-            else:
-                self.root.after(0, lambda: self.log_output("[Google] Skipped (No key)"))
-
-            # 3. OpenRouter Ping
-            or_key = keys.get("OPENROUTER_API_KEY", "").strip()
-            if or_key:
-                try:
-                    req_data = json.dumps({"model": "openrouter/auto", "messages": [{"role": "user", "content": "ping"}], "max_tokens": 1}).encode('utf-8')
-                    req = urllib.request.Request("https://openrouter.ai/api/v1/chat/completions", data=req_data, headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {or_key}', 'User-Agent': 'Mozilla/5.0'}, method='POST')
-                    with urllib.request.urlopen(req, timeout=8) as res:
-                        self.root.after(0, lambda: self.update_provider_ui("OPENROUTER_API_KEY", 14500, 15000, "60s"))
-                        self.root.after(0, lambda: self.log_output("[OpenRouter] SUCCESS"))
-                        success_count += 1
-                except Exception as e:
-                    self.root.after(0, lambda: self.mark_provider_error("OPENROUTER_API_KEY"))
-                    self.root.after(0, lambda err=str(e): self.log_output(f"[OpenRouter] Ping FAILED: {err}"))
-            else:
-                self.root.after(0, lambda: self.log_output("[OpenRouter] Skipped (No key)"))
-
-            # 4. OpenAI Ping
-            openai_key = keys.get("OPENAI_API_KEY", "").strip()
-            if openai_key:
-                try:
-                    req_data = json.dumps({"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "ping"}], "max_tokens": 1}).encode('utf-8')
-                    req = urllib.request.Request("https://api.openai.com/v1/chat/completions", data=req_data, headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {openai_key}', 'User-Agent': 'Mozilla/5.0'}, method='POST')
-                    with urllib.request.urlopen(req, timeout=8) as res:
-                        self.root.after(0, lambda: self.update_provider_ui("OPENAI_API_KEY", 14500, 15000, "Live"))
-                        self.root.after(0, lambda: self.log_output("[OpenAI] SUCCESS"))
-                        success_count += 1
-                except urllib.error.HTTPError as he:
-                    err_msg = f"HTTP {he.code}"
-                    if he.code == 429:
-                        err_msg += " (Quota/Billing)"
-                    self.root.after(0, lambda: self.mark_provider_error("OPENAI_API_KEY"))
-                    self.root.after(0, lambda err=err_msg: self.log_output(f"[OpenAI] Ping FAILED: {err}"))
-                except Exception as e:
-                    self.root.after(0, lambda: self.mark_provider_error("OPENAI_API_KEY"))
-                    self.root.after(0, lambda err=str(e): self.log_output(f"[OpenAI] Ping FAILED: {err}"))
-            else:
-                self.root.after(0, lambda: self.log_output("[OpenAI] Skipped (No key)"))
-
-            # 5. Cerebras Ping
-            cerebras_key = keys.get("CEREBRAS_API_KEY", "").strip()
-            if cerebras_key:
-                try:
-                    url = "https://api.cerebras.ai/v1/models"
-                    req = urllib.request.Request(url, headers={'Authorization': f'Bearer {cerebras_key}', 'User-Agent': 'Mozilla/5.0'}, method='GET')
-                    with urllib.request.urlopen(req, timeout=8) as res:
-                        self.root.after(0, lambda: self.update_provider_ui("CEREBRAS_API_KEY", 995000, 1000000, "Daily"))
-                        self.root.after(0, lambda: self.log_output("[Cerebras] SUCCESS (Native Auth)"))
-                        success_count += 1
-                except urllib.error.HTTPError as he:
-                    err_msg = f"HTTP {he.code}"
-                    self.root.after(0, lambda: self.mark_provider_error("CEREBRAS_API_KEY"))
-                    self.root.after(0, lambda err=err_msg: self.log_output(f"[Cerebras] FAILED: {err}"))
-                except Exception as e:
-                    self.root.after(0, lambda: self.mark_provider_error("CEREBRAS_API_KEY"))
-                    self.root.after(0, lambda err=str(e): self.log_output(f"[Cerebras] FAILED: {err}"))
-            else:
-                self.root.after(0, lambda: self.log_output("[Cerebras] Skipped (No key)"))
-
-            # 6. Mistral AI Ping 
-            mistral_key = keys.get("MISTRAL_API_KEY", "").strip()
-            if mistral_key:
-                try:
-                    req_data = json.dumps({"model": "mistral-small-latest", "messages": [{"role": "user", "content": "ping"}], "max_tokens": 1}).encode('utf-8')
-                    req = urllib.request.Request("https://api.mistral.ai/v1/chat/completions", data=req_data, headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {mistral_key}', 'User-Agent': 'Mozilla/5.0'}, method='POST')
-                    with urllib.request.urlopen(req, timeout=8) as res:
-                        self.root.after(0, lambda: self.update_provider_ui("MISTRAL_API_KEY", 14500, 15000, "Active"))
-                        self.root.after(0, lambda: self.log_output("[Mistral] SUCCESS"))
-                        success_count += 1
-                except urllib.error.HTTPError as he:
-                    err_msg = f"HTTP {he.code}"
-                    self.root.after(0, lambda: self.mark_provider_error("MISTRAL_API_KEY"))
-                    self.root.after(0, lambda err=err_msg: self.log_output(f"[Mistral] FAILED: {err}"))
-                except Exception as e:
-                    self.root.after(0, lambda: self.mark_provider_error("MISTRAL_API_KEY"))
-                    self.root.after(0, lambda err=str(e): self.log_output(f"[Mistral] FAILED: {err}"))
-            else:
-                self.root.after(0, lambda: self.log_output("[Mistral] Skipped (No key)"))
-
-            self.root.after(0, lambda: self.log_output(f"Ping cycle finished. {success_count}/6 uplink(s) active."))
-
-        threading.Thread(target=_ping_worker, daemon=True).start()
-
-    def update_provider_ui(self, key_id, rem, lim, reset_str):
-        if key_id not in self.provider_cards:
-            return
-        card = self.provider_cards[key_id]
-        used = lim - rem
-        
-        self.draw_progress_bar(card["canvas"], used, lim, active=True)
-        card["metrics"].config(text=f"Used: {used:,} / Limit: {lim:,} | Left: {rem:,} | Renews: {reset_str}")
-        card["state"].config(text="ACTIVE", fg=ACCENT_COLOR)
-
-    def mark_provider_error(self, key_id):
-        if key_id not in self.provider_cards:
-            return
-        card = self.provider_cards[key_id]
-        self.draw_progress_bar(card["canvas"], 0, 15000, active=False)
-        card["metrics"].config(text="Status: OFFLINE / ERROR")
-        card["state"].config(text="ERROR", fg=WARN_COLOR)
-
-    def open_keys_editor(self):
-        popup = tk.Toplevel(self.root)
-        popup.title("API Key Configuration")
-        popup.geometry("500x440")
-        popup.configure(bg=BG_COLOR)
-        popup.resizable(False, False)
-        
-        tk.Label(popup, text="UPLINK CREDENTIALS", font=FONT_TITLE, bg=BG_COLOR, fg=ACCENT_COLOR).pack(pady=8)
-        
-        current_keys = self.load_keys()
-                
-        entries = {}
-        providers = [
-            ("GROQ_API_KEY", "Groq Key:"), 
-            ("GOOGLE_API_KEY", "Google Gemini:"), 
-            ("OPENROUTER_API_KEY", "OpenRouter:"),
-            ("OPENAI_API_KEY", "OpenAI Key:"),
-            ("CEREBRAS_API_KEY", "Cerebras Key:"),
-            ("MISTRAL_API_KEY", "Mistral Key:")
-        ]
-                     
-        form_frame = tk.Frame(popup, bg=BG_COLOR)
-        form_frame.pack(fill="x", padx=15, pady=3)
-        
-        for k_id, label in providers:
-            row = tk.Frame(form_frame, bg=BG_COLOR)
-            row.pack(fill="x", pady=3)
-            tk.Label(row, text=label, width=15, anchor="e", font=FONT_BODY, bg=BG_COLOR, fg=TEXT_MAIN).pack(side="left")
-            ent = tk.Entry(row, font=FONT_BODY, bg=PANEL_COLOR, fg=ACCENT_COLOR, insertbackground=TEXT_MAIN, show="*")
-            ent.pack(side="left", fill="x", expand=True, padx=4)
-            ent.insert(0, current_keys.get(k_id, ""))
-            entries[k_id] = ent
-            
-        def save_keys():
-            for k_id, ent in entries.items():
-                current_keys[k_id] = ent.get().strip()
-            try:
-                success = secure_save_keys(current_keys)
-                if success:
-                    self.log_output("Encrypted API Credentials saved successfully.")
-                    self.build_provider_cards()
-                    popup.destroy()
-                else:
-                    self.log_output("[!] Vault encryption save failed.")
-            except Exception as e:
-                self.log_output(f"[!] Failed to save keys: {e}")
-                
-        tk.Button(popup, text="SAVE SECURE CREDENTIALS", font=FONT_BODY, bg=PANEL_COLOR, fg=TEXT_MAIN, relief="flat", command=save_keys).pack(pady=10)
 
 if __name__ == "__main__":
     root = tk.Tk()
-    app = TokenDashboard(root)
+    TokenDashboard(root)
     root.mainloop()

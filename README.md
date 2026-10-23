@@ -49,4 +49,4 @@ Config files: `~/lumi_routing.json` (routing), `~/lumi_providers.json` (model ov
 2. Install the dependency: `pip install cryptography` (Tkinter ships with most Python installs; on Debian/Raspberry Pi OS: `sudo apt install python3-tk`).
 3. Run: `python3 token_dashboard.py`, then **Manage API Keys** and **⚡ Test All Uplinks**.
 
-**Related:** the VPN rotator that uses this vault lives in its own repo: [VPN-dashboard](https://github.com/4rch0n-c0c0nu7/VPN-dashboard).
+**Related:** the VPN rotator that uses this vault lives in its own repo: [Leakproof-VPN-Rotator](https://github.com/4rch0n-c0c0nu7/Leakproof-VPN-Rotator).

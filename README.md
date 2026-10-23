@@ -12,11 +12,11 @@ Most open-source AI projects tell you to paste your highly sensitive API keys in
 
 **The Solution**
 
-This project provides a scalpel instead of a sledgehammer. It features a pure-Python, lightweight Tkinter HUD that routes your prompts across multiple providers (Groq, Gemini, Cerebras, OpenRouter, Mistral) while keeping your API keys locked inside a hardware-tied AES-256 encrypted vault.
+This project provides a scalpel instead of a sledgehammer. It features a pure-Python, lightweight Tkinter HUD that routes your prompts across multiple providers (Groq, Gemini, Cerebras, OpenRouter, Mistral) while keeping your API keys locked inside a hardware-bound AES-256-GCM encrypted vault.
 
 **Key Features**
 
-* **Hardware-Locked Encryption:** Uses cryptography.fernet and PBKDF2HMAC to encrypt your keys. The decryption key is derived from a salt and your system's hardware ID (/etc/machine-id on Linux, falling back to UUID on Mac/Windows). If the keys file is stolen and moved to another computer, it cannot be decrypted.
+* **Hardware-bound AES-256-GCM encryption:** Keys are sealed with AES-256-GCM (authenticated encryption) under a key derived via PBKDF2-HMAC-SHA256 (200k iterations) from a random per-vault salt plus your machine's hardware ID (`/etc/machine-id`, falling back to the NIC UUID). A stolen vault file is useless on any other machine. Set `LUMI_VAULT_PASSPHRASE` to mix in a secret that never touches disk — then even a local attacker needs it too. Older vaults are read and migrated automatically.
 * **Real Health Checks:** TEST sends a tiny real chat request to the exact model you've configured. A key that's valid but pointed at a retired model, out of credits, or rate-limited shows up as FAILING with the provider's own error message, not a false "SUCCESS".
 * **Real Usage Telemetry:** Calls, tokens and errors per provider for today (from your assistant's actual calls, via a shared usage ledger), plus the provider's own rate-limit meters when it sends them (Groq, Cerebras, Mistral). No placeholder numbers.
 * **Model Picker:** Each card can list the provider's live model catalog and switch models with one click (then auto-tests it).
